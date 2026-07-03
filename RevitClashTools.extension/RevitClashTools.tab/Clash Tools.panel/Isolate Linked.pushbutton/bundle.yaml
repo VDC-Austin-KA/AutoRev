@@ -1,0 +1,5 @@
+title: Isolate Linked
+tooltip: >
+  Isolate elements from a linked model in the active view, filtered by
+  category. Includes visibility so you can restrict a link down to just
+  the elements you care about.

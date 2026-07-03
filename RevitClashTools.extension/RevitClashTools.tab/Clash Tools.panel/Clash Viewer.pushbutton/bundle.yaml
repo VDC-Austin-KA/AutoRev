@@ -1,0 +1,5 @@
+title: Clash Viewer
+tooltip: >
+  Import a Navisworks Clash Detective XML report, map each clash side to
+  a loaded Revit link (or the host model), and color/isolate the
+  matched elements by model or by individual clash.
