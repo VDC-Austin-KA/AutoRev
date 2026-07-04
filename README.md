@@ -14,9 +14,25 @@ elements. The category filter is optional — cancel it to keep all
 categories.
 
 ### Clash Viewer
-Import a Navisworks Clash Detective **XML** report, map each clash side
-to a loaded Revit link (or the host model), and color / isolate the
-matched elements per source model.
+Import a Navisworks Clash Detective **XML** report, resolve each clash
+side to a real Revit element, then **group and color the clashed
+elements by any parameter**.
+
+**Workflow:**
+
+1. Map each source model in the report to a loaded Revit link (or the
+   host model), then **Resolve Elements**.
+2. Choose a **Group by** key and click **Build Groups** — one color
+   group is created per distinct value across all resolved clash
+   elements, with colors auto-assigned from a distinct palette.
+3. Edit any group's color or untick groups you want to skip.
+4. **Apply Colors** (and **Reset View** to clear everything).
+
+**Group by** supports: Source File, Category, Family, Type, System
+Classification, System Type, System Name, Workset, Level, Clash Test, or
+a **Custom Parameter** (type the parameter name — read per element via
+`LookupParameter`). This effectively creates a color-coded filter over
+the clashed elements for whichever parameter you choose.
 
 **Element matching** does not depend on any single "Write Report" export
 option in Navisworks. For each clash item it tries, in order:
@@ -33,10 +49,13 @@ selected row to view that clash's exact XML if matching fails.
 
 **Known limitation:** Revit's graphic-override API supports per-element
 colors for host-document elements, but only whole-link overrides for
-linked elements. When elements from the same link belong to different
-clashes, they share that link's color; isolation still narrows the link
-to only the matched clash elements so they read as highlighted. **Reset
-View** clears all overrides and restores full link visibility.
+linked elements. When a single link holds clashed elements belonging to
+more than one color group, that link is colored by its **dominant**
+group (the one covering the most elements) and a note lists the affected
+links. Host elements always get exact per-group colors. The optional
+"Isolate link to clash elems" narrows each mapped link to only its
+matched clash elements. **Reset View** clears all overrides and restores
+full link visibility.
 
 ## Installation
 

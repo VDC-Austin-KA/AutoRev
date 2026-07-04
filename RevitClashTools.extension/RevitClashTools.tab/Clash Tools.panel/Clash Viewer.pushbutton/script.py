@@ -1,39 +1,39 @@
 # -*- coding: utf-8 -*-
-"""Import a Navisworks Clash Detective XML report, let the user say which
-Revit link (or the host model) each clash side came from, and color /
-isolate the matched elements in the active view.
+"""Import a Navisworks Clash Detective XML report, resolve each clash side
+to a real Revit element, then GROUP the clashed elements by a parameter of
+your choosing (source file, category, family, type, system classification,
+system type/name, workset, level, clash test, or any custom parameter) and
+color each group in the active view.
+
+Workflow
+--------
+1. Map each source model in the report to a loaded Revit link (or host).
+2. Resolve Elements - matches each clash side to a Revit element.
+3. Group by <parameter> -> Build Groups. One color group is created per
+   distinct parameter value across all resolved clashed elements.
+4. Edit the auto-assigned color per group / untick groups to skip them.
+5. Apply Colors. Reset View clears everything.
 
 Matching strategy
-------------------
-Which per-item properties Navisworks writes into the report depends on
-checkboxes in its "Write Report" dialog, so this tries several clues in
-order of reliability rather than depending on any single one:
-
-  1. A GUID-like property (Revit's Element.UniqueId, or an IFC GUID) -
-     resolved via `document.GetElement(guid)` directly, or against a
-     per-document IFC_GUID parameter cache built on first use.
-  2. A bare numeric element-id property (e.g. "Element ID"/"Item ID") -
-     resolved via `document.GetElement(ElementId(int(value)))`.
-  3. A trailing "[12345]"/"(12345)" in the item's own display name -
-     Revit's Navisworks exporter bakes the ElementId into item names by
-     default, so this survives even a report with no item properties
-     exported at all.
-
-Use "Resolve GUIDs" to see the match rate, and "Inspect Raw XML" on a
-selected row to see exactly what that clash contains if matching fails -
-that raw XML is the fastest way to extend the parser for a report style
-it doesn't already handle.
-
-Known limitation
 -----------------
-Per-element color overrides are fully supported for host-document
-elements. For linked-model elements, the Revit API only supports view
-overrides at the *link instance* granularity (the whole link gets one
-color). To still highlight only the clashing elements within a link,
-this tool uses RevitLinkInstance.SetVisibleElements to hide everything
-in that link except the matched clash elements, then applies the link's
-color - so visually you get per-clash highlighting, just not mixed
-colors within the same link at the same time.
+Independent of Navisworks "Write Report" export options. Per clash item:
+  1. GUID property (Revit Element.UniqueId, or IFC GUID via IFC_GUID param).
+  2. Numeric element-id property (e.g. "Element ID"/"Item ID").
+  3. Trailing "[12345]"/"(12345)" baked into the item name by Revit's
+     Navisworks exporter (works with no item properties exported at all).
+Use "Inspect Raw XML" on a selected row to see what an unmatched clash
+actually contains.
+
+Known limitation (linked elements)
+----------------------------------
+The Revit API supports true per-element graphic overrides for
+host-document elements. For linked-model elements it only supports
+overrides at the link-instance level (one color per link). So when a
+single link holds clashed elements belonging to more than one color
+group, that link is colored by its dominant group and a warning lists
+the affected links. Host elements always get exact per-group colors.
+"Isolate link to clash elems" narrows each mapped link to just its
+matched clash elements via SetVisibleElements.
 """
 
 import clr
@@ -41,9 +41,7 @@ clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("System.Windows.Forms")
 
-from System.Windows import Window
 from System.Collections.ObjectModel import ObservableCollection
-from System.Collections.Generic import List
 
 from pyrevit import revit, DB, forms, script
 
@@ -55,28 +53,60 @@ view = doc.ActiveView
 output = script.get_output()
 logger = script.get_logger()
 
+# Ordered so auto-assignment cycles through visually distinct hues first.
+COLOR_ORDER = [
+    "Red", "Blue", "Green", "Orange", "Magenta",
+    "Cyan", "Yellow", "Purple", "Lime", "Pink",
+    "Teal", "Brown", "Gray",
+]
 COLOR_PRESETS = {
     "Red": DB.Color(255, 0, 0),
-    "Green": DB.Color(0, 200, 0),
     "Blue": DB.Color(0, 100, 255),
+    "Green": DB.Color(0, 200, 0),
     "Orange": DB.Color(255, 140, 0),
     "Magenta": DB.Color(230, 0, 230),
     "Cyan": DB.Color(0, 200, 200),
     "Yellow": DB.Color(230, 210, 0),
     "Purple": DB.Color(130, 0, 200),
+    "Lime": DB.Color(160, 230, 0),
+    "Pink": DB.Color(255, 120, 180),
+    "Teal": DB.Color(0, 150, 136),
+    "Brown": DB.Color(140, 80, 20),
+    "Gray": DB.Color(130, 130, 130),
 }
+
+GROUP_KEYS = [
+    "Source File",
+    "Category",
+    "Family",
+    "Type",
+    "System Classification",
+    "System Type",
+    "System Name",
+    "Workset",
+    "Level",
+    "Clash Test",
+    "Custom Parameter",
+]
+
+
+# --------------------------------------------------------------------------
+# Graphic override helpers
+# --------------------------------------------------------------------------
+_solid_fill_cache = {}
 
 
 def get_solid_fill_pattern_id(document):
-    fp = (
-        DB.FilteredElementCollector(document)
-        .OfClass(DB.FillPatternElement)
-        .ToElements()
-    )
-    for f in fp:
+    key = document.PathName or document.Title
+    if key in _solid_fill_cache:
+        return _solid_fill_cache[key]
+    result = DB.ElementId.InvalidElementId
+    for f in DB.FilteredElementCollector(document).OfClass(DB.FillPatternElement):
         if f.GetFillPattern().IsSolidFill:
-            return f.Id
-    return DB.ElementId.InvalidElementId
+            result = f.Id
+            break
+    _solid_fill_cache[key] = result
+    return result
 
 
 def build_ogs(document, color):
@@ -92,35 +122,89 @@ def build_ogs(document, color):
     return ogs
 
 
-class ModelRow(object):
-    def __init__(self, source_file):
-        self.SourceFile = source_file
-        self.LinkChoice = None
-        self.ColorChoice = "Red"
-        self.Isolate = True
-        self.target_doc = None  # resolved DB.Document
-        self.link_instance = None  # resolved DB.RevitLinkInstance or None (=host)
+# --------------------------------------------------------------------------
+# Parameter reading for grouping
+# --------------------------------------------------------------------------
+def _param_str(el, bip):
+    try:
+        p = el.get_Parameter(bip)
+    except Exception:
+        return None
+    if p is None:
+        return None
+    try:
+        return p.AsValueString() or p.AsString()
+    except Exception:
+        return None
 
 
-class ClashRow(object):
-    def __init__(self, pair):
-        self.TestName = pair.test_name
-        self.ResultName = pair.result_name
-        self.Status = pair.status
-        self.NameA = pair.item_a.name
-        self.SourceA = pair.item_a.source_file
-        self.NameB = pair.item_b.name
-        self.SourceB = pair.item_b.source_file
-        self.MatchedA = ""
-        self.MatchedB = ""
-        self.pair = pair
-        self.id_a = None
-        self.id_b = None
-        self.doc_a = None
-        self.doc_b = None
-        self.raw_xml = pair.raw_xml
+def get_group_value(el, document, key, source_file, test_name, custom_name):
+    """Return the grouping value (string) for a resolved element."""
+    if key == "Source File":
+        return source_file or "(unknown source)"
+    if key == "Clash Test":
+        return test_name or "(no test)"
+    if el is None:
+        return "(element not found)"
+    if key == "Category":
+        return el.Category.Name if el.Category else "(no category)"
+    if key == "Family":
+        return _param_str(el, DB.BuiltInParameter.ELEM_FAMILY_PARAM) or "(no family)"
+    if key == "Type":
+        return _param_str(el, DB.BuiltInParameter.ELEM_TYPE_PARAM) or "(no type)"
+    if key == "System Classification":
+        return (
+            _param_str(el, DB.BuiltInParameter.RBS_SYSTEM_CLASSIFICATION_PARAM)
+            or "(no system classification)"
+        )
+    if key == "System Type":
+        return (
+            _param_str(el, DB.BuiltInParameter.RBS_SYSTEM_TYPE_PARAM)
+            or "(no system type)"
+        )
+    if key == "System Name":
+        return (
+            _param_str(el, DB.BuiltInParameter.RBS_SYSTEM_NAME_PARAM)
+            or "(no system name)"
+        )
+    if key == "Workset":
+        try:
+            if document.IsWorkshared:
+                ws = document.GetWorksetTable().GetWorkset(el.WorksetId)
+                return ws.Name
+        except Exception:
+            pass
+        return "(not workshared)"
+    if key == "Level":
+        try:
+            lvl_id = el.LevelId
+            if lvl_id and lvl_id != DB.ElementId.InvalidElementId:
+                lvl = document.GetElement(lvl_id)
+                if lvl is not None:
+                    return lvl.Name
+        except Exception:
+            pass
+        return _param_str(el, DB.BuiltInParameter.LEVEL_PARAM) or "(no level)"
+    if key == "Custom Parameter":
+        if not custom_name:
+            return "(no parameter name entered)"
+        try:
+            p = el.LookupParameter(custom_name)
+        except Exception:
+            p = None
+        if p is None:
+            return "(parameter '{}' not found)".format(custom_name)
+        try:
+            v = p.AsValueString() or p.AsString()
+        except Exception:
+            v = None
+        return v or "(empty)"
+    return "(unknown grouping)"
 
 
+# --------------------------------------------------------------------------
+# Element resolution
+# --------------------------------------------------------------------------
 def find_ifc_guid_map(document):
     cache = {}
     for el in DB.FilteredElementCollector(document).WhereElementIsNotElementType():
@@ -145,7 +229,6 @@ def resolve_by_guid(document, guid):
             return el.Id
     except Exception:
         pass
-
     key = document.PathName or document.Title
     if key not in _ifc_cache:
         _ifc_cache[key] = find_ifc_guid_map(document)
@@ -164,7 +247,6 @@ def resolve_by_numeric_id(document, numeric_id):
 
 
 def resolve_item(document, item):
-    """Try every available clue on the item, in order of reliability."""
     eid = resolve_by_guid(document, item.guid)
     if eid is not None:
         return eid, "guid"
@@ -189,12 +271,66 @@ def guess_link_for_source(source_file, links):
     return None
 
 
+# --------------------------------------------------------------------------
+# View-model rows
+# --------------------------------------------------------------------------
+class ModelRow(object):
+    def __init__(self, source_file):
+        self.SourceFile = source_file
+        self.LinkChoice = None
+        self.Isolate = True
+        self.target_doc = None
+        self.link_instance = None
+
+
+class ClashRow(object):
+    def __init__(self, pair):
+        self.TestName = pair.test_name
+        self.ResultName = pair.result_name
+        self.Status = pair.status
+        self.NameA = pair.item_a.name
+        self.SourceA = pair.item_a.source_file
+        self.NameB = pair.item_b.name
+        self.SourceB = pair.item_b.source_file
+        self.MatchedA = ""
+        self.MatchedB = ""
+        self.pair = pair
+        self.raw_xml = pair.raw_xml
+
+
+class GroupRow(object):
+    def __init__(self, group_value, count, color_choice):
+        self.GroupValue = group_value
+        self.Count = count
+        self.ColorChoice = color_choice
+        self.Include = True
+
+
+class ResolvedElem(object):
+    """A single clash side that resolved to a Revit element."""
+    def __init__(self, eid, document, link_instance, source_file, test_name):
+        self.eid = eid
+        self.doc = document
+        self.link_instance = link_instance  # None => host
+        self.source_file = source_file
+        self.test_name = test_name
+
+
+# --------------------------------------------------------------------------
+# Window
+# --------------------------------------------------------------------------
 class ClashViewerWindow(forms.WPFWindow):
     def __init__(self, xaml_path, pairs, links):
         forms.WPFWindow.__init__(self, xaml_path)
         self.pairs = pairs
         self.links = links
         self.link_names = ["<< HOST MODEL >>"] + [li.Name for li in links]
+
+        self.resolved = []            # list[ResolvedElem]
+        self.group_rows = None        # ObservableCollection[GroupRow]
+        self.group_by_value = {}      # group value -> GroupRow
+        self.active_group_key = None
+        self.active_custom_name = ""
 
         sources = clash_parser.distinct_source_files(pairs)
         self.model_rows = ObservableCollection[object]()
@@ -208,24 +344,31 @@ class ClashViewerWindow(forms.WPFWindow):
         for pair in pairs:
             self.clash_rows.Add(ClashRow(pair))
 
-        self.DataContext = self
-        self.SummaryText = "{} clash(es) parsed across {} test(s), {} source model(s) found.".format(
-            len(pairs),
-            len(set(p.test_name for p in pairs)),
-            len(sources),
+        self.SummaryText = (
+            "{} clash(es) parsed across {} test(s), {} source model(s) found. "
+            "Map sources -> Resolve -> choose a Group by -> Build Groups -> "
+            "Apply Colors.".format(
+                len(pairs),
+                len(set(p.test_name for p in pairs)),
+                len(sources),
+            )
         )
+        self.DataContext = self
 
         self.ModelsGrid.ItemsSource = self.model_rows
         self.ClashesGrid.ItemsSource = self.clash_rows
 
         self.LinkColumn.ItemsSource = self.link_names
         self.LinkColumn.SelectedItemBinding = self._binding("LinkChoice")
-        self.ColorColumn.ItemsSource = list(COLOR_PRESETS.keys())
-        self.ColorColumn.SelectedItemBinding = self._binding("ColorChoice")
+
+        self.GroupColorColumn.ItemsSource = COLOR_ORDER
+        self.GroupColorColumn.SelectedItemBinding = self._binding("ColorChoice")
+
+        self.GroupByCombo.ItemsSource = GROUP_KEYS
+        self.GroupByCombo.SelectedIndex = 0
 
     def _binding(self, path):
         from System.Windows.Data import Binding
-
         return Binding(path)
 
     def _row_target(self, row):
@@ -236,19 +379,21 @@ class ClashViewerWindow(forms.WPFWindow):
                 link_doc = li.GetLinkDocument()
                 if link_doc is None:
                     forms.alert(
-                        "Link '{}' is not loaded - can't resolve elements in it.".format(li.Name)
+                        "Link '{}' is not loaded - can't resolve elements in "
+                        "it.".format(li.Name)
                     )
                     return None, None
                 return link_doc, li
         return None, None
 
+    # -- Step: resolve --------------------------------------------------
     def resolve_click(self, sender, args):
         row_by_source = {r.SourceFile: r for r in self.model_rows}
         for r in row_by_source.values():
             r.target_doc, r.link_instance = self._row_target(r)
 
+        self.resolved = []
         matched, total = 0, 0
-        unmatched_sample = None
         for crow in self.clash_rows:
             for side_letter in ("a", "b"):
                 item = getattr(crow.pair, "item_" + side_letter)
@@ -258,29 +403,143 @@ class ClashViewerWindow(forms.WPFWindow):
                     setattr(crow, "Matched" + side_letter.upper(), "no target")
                     continue
                 eid, via = resolve_item(row.target_doc, item)
-                setattr(crow, "id_" + side_letter, eid)
-                setattr(crow, "doc_" + side_letter, row.target_doc)
                 setattr(
-                    crow,
-                    "Matched" + side_letter.upper(),
+                    crow, "Matched" + side_letter.upper(),
                     "yes ({})".format(via) if eid else "no",
                 )
                 if eid:
                     matched += 1
-                elif unmatched_sample is None:
-                    unmatched_sample = crow
+                    self.resolved.append(
+                        ResolvedElem(
+                            eid, row.target_doc, row.link_instance,
+                            item.source_file, crow.pair.test_name,
+                        )
+                    )
 
         self.ClashesGrid.Items.Refresh()
         msg = "Resolved {}/{} clash-side elements.".format(matched, total)
-        if matched < total:
+        if matched == 0:
             msg += (
-                "\n\nSome items had neither a GUID nor an element-id property, "
-                "and no [id] suffix in the item name. Select an unmatched row "
-                "and click 'Inspect Raw XML' to see exactly what that clash "
-                "contains, then send it over so the parser can be tuned to it."
+                "\n\nNothing resolved. Check the source->link mapping above, "
+                "then use 'Inspect Raw XML' on a row to see what identifiers "
+                "the report carries."
             )
+        else:
+            msg += "\n\nNow pick a 'Group by' and click Build Groups."
         forms.alert(msg)
 
+    # -- Step: build groups --------------------------------------------
+    def build_groups_click(self, sender, args):
+        if not self.resolved:
+            forms.alert("Resolve elements first (step 2).")
+            return
+
+        key = self.GroupByCombo.SelectedItem or GROUP_KEYS[0]
+        custom_name = (self.CustomParamBox.Text or "").strip()
+        self.active_group_key = key
+        self.active_custom_name = custom_name
+
+        counts = {}
+        order = []
+        for rel in self.resolved:
+            el = rel.doc.GetElement(rel.eid)
+            val = get_group_value(
+                el, rel.doc, key, rel.source_file, rel.test_name, custom_name
+            )
+            if val not in counts:
+                counts[val] = 0
+                order.append(val)
+            counts[val] += 1
+
+        self.group_rows = ObservableCollection[object]()
+        self.group_by_value = {}
+        for i, val in enumerate(sorted(order, key=lambda v: (-counts[v], v))):
+            color = COLOR_ORDER[i % len(COLOR_ORDER)]
+            grow = GroupRow(val, counts[val], color)
+            self.group_rows.Add(grow)
+            self.group_by_value[val] = grow
+
+        self.GroupsGrid.ItemsSource = self.group_rows
+        forms.alert(
+            "Built {} group(s) by '{}'. Adjust colors / includes, then "
+            "Apply Colors.".format(len(order), key)
+        )
+
+    # -- Step: apply ----------------------------------------------------
+    def apply_click(self, sender, args):
+        if not self.group_rows:
+            forms.alert("Build groups first (step 3).")
+            return
+
+        isolate_by_link = {}
+        for r in self.model_rows:
+            if r.link_instance is not None:
+                isolate_by_link[r.link_instance] = r.Isolate
+
+        host_buckets = {}   # color_name -> set(ElementId)
+        link_color = {}     # link_instance -> {color_name: set(ElementId)}
+        link_visible = {}   # link_instance -> set(ElementId)
+
+        for rel in self.resolved:
+            el = rel.doc.GetElement(rel.eid)
+            val = get_group_value(
+                el, rel.doc, self.active_group_key,
+                rel.source_file, rel.test_name, self.active_custom_name,
+            )
+            grow = self.group_by_value.get(val)
+            if grow is None or not grow.Include:
+                continue
+            color_name = grow.ColorChoice
+            if rel.link_instance is None:
+                host_buckets.setdefault(color_name, set()).add(rel.eid)
+            else:
+                li = rel.link_instance
+                link_color.setdefault(li, {}).setdefault(color_name, set()).add(rel.eid)
+                link_visible.setdefault(li, set()).add(rel.eid)
+
+        mixed_links = []
+        with revit.Transaction("Apply Clash Group Colors"):
+            for color_name, ids in host_buckets.items():
+                ogs = build_ogs(doc, COLOR_PRESETS[color_name])
+                for eid in ids:
+                    view.SetElementOverrides(eid, ogs)
+
+            for li, colormap in link_color.items():
+                link_doc = li.GetLinkDocument()
+                # dominant color = the one covering the most elements
+                dominant = max(colormap.items(), key=lambda kv: len(kv[1]))[0]
+                if len(colormap) > 1:
+                    mixed_links.append((li.Name, len(colormap), dominant))
+                ogs = build_ogs(link_doc, COLOR_PRESETS[dominant])
+                view.SetElementOverrides(li.Id, ogs)
+                if isolate_by_link.get(li, False):
+                    id_collection = DB.List[DB.ElementId]()
+                    for eid in link_visible[li]:
+                        id_collection.Add(eid)
+                    li.SetVisibleElements(id_collection)
+
+        host_count = sum(len(v) for v in host_buckets.values())
+        output.print_md(
+            "**Applied colors** grouped by `{}`: "
+            "{} host element(s), {} link(s).".format(
+                self.active_group_key, host_count, len(link_color)
+            )
+        )
+        if mixed_links:
+            lines = "\n".join(
+                "- `{}`: {} groups present, colored by dominant '{}'".format(
+                    name, n, dom
+                )
+                for name, n, dom in mixed_links
+            )
+            output.print_md(
+                "**Note - links with mixed groups** (Revit only allows one "
+                "override color per link, so these used their dominant "
+                "group's color):\n" + lines
+            )
+            output.show()
+
+    # -- Utilities ------------------------------------------------------
     def inspect_click(self, sender, args):
         selected = self.ClashesGrid.SelectedItem
         if selected is None:
@@ -290,63 +549,15 @@ class ClashViewerWindow(forms.WPFWindow):
         output.print_md("```xml\n{}\n```".format(raw))
         output.show()
 
-    def apply_click(self, sender, args):
-        row_by_source = {r.SourceFile: r for r in self.model_rows}
-
-        # bucket matched ids by target: host doc, or per link instance
-        host_ids = {}  # color_name -> set(ElementId)
-        link_ids = {}  # link_instance -> (color_name, set(ElementId), isolate_flag)
-
-        for crow in self.clash_rows:
-            for side_letter in ("a", "b"):
-                item = getattr(crow.pair, "item_" + side_letter)
-                eid = getattr(crow, "id_" + side_letter)
-                if eid is None:
-                    continue
-                row = row_by_source.get(item.source_file)
-                if row is None:
-                    continue
-                if row.link_instance is None:
-                    host_ids.setdefault(row.ColorChoice, set()).add(eid)
-                else:
-                    bucket = link_ids.setdefault(
-                        row.link_instance, [row.ColorChoice, set(), row.Isolate]
-                    )
-                    bucket[1].add(eid)
-
-        with revit.Transaction("Apply Clash Overrides"):
-            for color_name, ids in host_ids.items():
-                ogs = build_ogs(doc, COLOR_PRESETS[color_name])
-                for eid in ids:
-                    view.SetElementOverrides(eid, ogs)
-
-            for li, (color_name, ids, isolate) in link_ids.items():
-                link_doc = li.GetLinkDocument()
-                ogs = build_ogs(link_doc, COLOR_PRESETS[color_name])
-                view.SetElementOverrides(li.Id, ogs)
-                if isolate:
-                    id_collection = DB.List[DB.ElementId]()
-                    for eid in ids:
-                        id_collection.Add(eid)
-                    li.SetVisibleElements(id_collection)
-
-        output.print_md(
-            "Applied overrides: **{} host element(s)**, **{} link(s)**.".format(
-                sum(len(v) for v in host_ids.values()), len(link_ids)
-            )
-        )
-
     def reset_click(self, sender, args):
+        blank = DB.OverrideGraphicSettings()
         with revit.Transaction("Reset Clash Overrides"):
             for li in self.links:
                 li.SetVisibleElements(None)
-                view.SetElementOverrides(li.Id, DB.OverrideGraphicSettings())
-            for crow in self.clash_rows:
-                for side_letter in ("a", "b"):
-                    eid = getattr(crow, "id_" + side_letter)
-                    doc_side = getattr(crow, "doc_" + side_letter)
-                    if eid is not None and doc_side is doc:
-                        view.SetElementOverrides(eid, DB.OverrideGraphicSettings())
+                view.SetElementOverrides(li.Id, blank)
+            for rel in self.resolved:
+                if rel.link_instance is None:
+                    view.SetElementOverrides(rel.eid, blank)
         forms.alert("View overrides and link visibility reset.")
 
     def close_click(self, sender, args):
@@ -354,7 +565,9 @@ class ClashViewerWindow(forms.WPFWindow):
 
 
 def main():
-    xml_path = forms.pick_file(file_ext="xml", title="Select Navisworks Clash Report (XML)")
+    xml_path = forms.pick_file(
+        file_ext="xml", title="Select Navisworks Clash Report (XML)"
+    )
     if not xml_path:
         script.exit()
 
