@@ -40,12 +40,13 @@ import clr
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("System.Windows.Forms")
-# ObservableCollection lives in the WindowsBase assembly; under IronPython it
-# must be referenced explicitly or the import below fails with
-# "Cannot import name ObservableCollection".
-clr.AddReference("WindowsBase")
 
-from System.Collections.ObjectModel import ObservableCollection
+# NOTE: the DataGrids are bound to System.Collections.Generic.List rather than
+# ObservableCollection on purpose. ObservableCollection lives in the WindowsBase
+# assembly, which some IronPython/pyRevit builds fail to resolve ("Cannot import
+# name ObservableCollection"). List is in mscorlib (always loaded) and is fine
+# for WPF binding here: each collection is populated once and assigned to
+# ItemsSource, never mutated after binding, so change-notification is not needed.
 from System.Collections.Generic import List
 
 from pyrevit import revit, DB, forms, script
@@ -332,20 +333,20 @@ class ClashViewerWindow(forms.WPFWindow):
         self.link_names = ["<< HOST MODEL >>"] + [li.Name for li in links]
 
         self.resolved = []            # list[ResolvedElem]
-        self.group_rows = None        # ObservableCollection[GroupRow]
+        self.group_rows = None        # List[GroupRow]
         self.group_by_value = {}      # group value -> GroupRow
         self.active_group_key = None
         self.active_custom_name = ""
 
         sources = clash_parser.distinct_source_files(pairs)
-        self.model_rows = ObservableCollection[object]()
+        self.model_rows = List[object]()
         for src in sources:
             row = ModelRow(src)
             guessed = guess_link_for_source(src, links)
             row.LinkChoice = guessed.Name if guessed else self.link_names[0]
             self.model_rows.Add(row)
 
-        self.clash_rows = ObservableCollection[object]()
+        self.clash_rows = List[object]()
         for pair in pairs:
             self.clash_rows.Add(ClashRow(pair))
 
@@ -456,7 +457,7 @@ class ClashViewerWindow(forms.WPFWindow):
                 order.append(val)
             counts[val] += 1
 
-        self.group_rows = ObservableCollection[object]()
+        self.group_rows = List[object]()
         self.group_by_value = {}
         for i, val in enumerate(sorted(order, key=lambda v: (-counts[v], v))):
             color = COLOR_ORDER[i % len(COLOR_ORDER)]
