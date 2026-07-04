@@ -16,11 +16,14 @@ Workflow
 
 Matching strategy
 -----------------
-Independent of Navisworks "Write Report" export options. Per clash item:
-  1. GUID property (Revit Element.UniqueId, or IFC GUID via IFC_GUID param).
-  2. Numeric element-id property (e.g. "Element ID"/"Item ID").
-  3. Trailing "[12345]"/"(12345)" baked into the item name by Revit's
-     Navisworks exporter (works with no item properties exported at all).
+Independent of Navisworks "Write Report" export options. Per clash item,
+resolved against the mapped (linked or host) document in this order:
+  1. Numeric element-id (the "Element Id" smarttag, or a trailing
+     "[12345]" in the item name) -> GetElement(ElementId(n)). This is
+     the reliable key for Revit-authored models.
+  2. GUID property -> GetElement(uniqueId), then the IFC_GUID parameter.
+     Note Navisworks' own <objectattribute>GUID is a computed hash, not a
+     Revit UniqueId, so this mainly helps IFC-sourced models.
 Use "Inspect Raw XML" on a selected row to see what an unmatched clash
 actually contains.
 
@@ -253,12 +256,17 @@ def resolve_by_numeric_id(document, numeric_id):
 
 
 def resolve_item(document, item):
-    eid = resolve_by_guid(document, item.guid)
-    if eid is not None:
-        return eid, "guid"
+    # Element Id first: Navisworks exports the Revit ElementId in a
+    # smarttag, and it resolves exactly in the mapped (linked) document.
+    # The <objectattribute>GUID that Navisworks writes is its own computed
+    # hash, NOT a Revit UniqueId, so it only helps for IFC-sourced models
+    # (matched against the IFC_GUID parameter) - hence it's the fallback.
     eid = resolve_by_numeric_id(document, item.numeric_id)
     if eid is not None:
         return eid, "id"
+    eid = resolve_by_guid(document, item.guid)
+    if eid is not None:
+        return eid, "guid"
     return None, None
 
 
@@ -579,9 +587,25 @@ def main():
 
     pairs = clash_parser.parse_clash_report(xml_path)
     if not pairs:
+        # Dump the report's actual structure to the output window so an
+        # unrecognized layout can be diagnosed instead of guessed at.
+        try:
+            diag = clash_parser.describe_structure(xml_path)
+        except Exception as ex:
+            diag = "Could not analyze the file: {}".format(ex)
+        output.print_md(
+            "### No clashes could be parsed\n"
+            "The file didn't match any clash layout the parser recognizes. "
+            "The structure census below shows what's actually in it - send "
+            "it over (or paste the `<clashresult>` sample) so the parser can "
+            "be matched to your export.\n"
+        )
+        output.print_md("```\n{}\n```".format(diag))
+        output.show()
         forms.alert(
-            "No clashes could be parsed from that file. Confirm it was exported "
-            "as an XML report from Clash Detective (Report > Write Report > XML).",
+            "No clashes could be parsed. A structure report was written to "
+            "the pyRevit output window - share that so the parser can be "
+            "tuned to this report's format.",
             exitscript=True,
         )
 

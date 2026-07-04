@@ -37,15 +37,26 @@ the clashed elements for whichever parameter you choose.
 **Element matching** does not depend on any single "Write Report" export
 option in Navisworks. For each clash item it tries, in order:
 
-1. A GUID property (Revit `Element.UniqueId`, or an IFC GUID → matched
-   against the `IFC_GUID` parameter).
-2. A bare numeric element-id property (e.g. "Element ID" / "Item ID").
-3. The trailing `[12345]` / `(12345)` that Revit's Navisworks exporter
-   bakes into every item's display name by default — so matching works
-   even when no item properties were exported at all.
+1. A numeric element id — the `Element Id` smarttag, or a trailing
+   `[12345]` / `(12345)` in the item name — resolved via
+   `GetElement(ElementId(n))` in the mapped document. This is the
+   reliable key for Revit-authored models.
+2. A GUID property — resolved via `GetElement(uniqueId)`, then against
+   the `IFC_GUID` parameter. Note Navisworks' own `<objectattribute>`
+   GUID is a computed hash, **not** a Revit `UniqueId`, so this path
+   mainly helps IFC-sourced models.
 
-Use **Resolve GUIDs** to see the match rate, and **Inspect Raw XML** on a
-selected row to view that clash's exact XML if matching fails.
+The parser reads the standard Navisworks `<exchange>` report layout
+(`<clashtest>` → `<clashresult>` → `<clashobjects>` → `<clashobject>`,
+with `<smarttag>`/`<objectattribute>` name/value children and the model
+path in `<pathlink>`/`<node>`), and prefers the authored model
+(`.rvt`/`.ifc`/…) over the Navisworks cache (`.nwc`) as each side's
+source, so it lines up with your Revit link names.
+
+Use **Resolve Elements** to see the match rate, and **Inspect Raw XML**
+on a selected row to view that clash's exact XML if matching fails. If a
+report can't be parsed at all, the tool writes a tag-structure census to
+the pyRevit output window to diagnose the format.
 
 **Known limitation:** Revit's graphic-override API supports per-element
 colors for host-document elements, but only whole-link overrides for
