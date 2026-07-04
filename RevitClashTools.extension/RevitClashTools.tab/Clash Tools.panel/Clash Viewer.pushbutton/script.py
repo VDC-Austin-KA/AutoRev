@@ -40,8 +40,13 @@ import clr
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("System.Windows.Forms")
+# ObservableCollection lives in the WindowsBase assembly; under IronPython it
+# must be referenced explicitly or the import below fails with
+# "Cannot import name ObservableCollection".
+clr.AddReference("WindowsBase")
 
 from System.Collections.ObjectModel import ObservableCollection
+from System.Collections.Generic import List
 
 from pyrevit import revit, DB, forms, script
 
@@ -513,7 +518,7 @@ class ClashViewerWindow(forms.WPFWindow):
                 ogs = build_ogs(link_doc, COLOR_PRESETS[dominant])
                 view.SetElementOverrides(li.Id, ogs)
                 if isolate_by_link.get(li, False):
-                    id_collection = DB.List[DB.ElementId]()
+                    id_collection = List[DB.ElementId]()
                     for eid in link_visible[li]:
                         id_collection.Add(eid)
                     li.SetVisibleElements(id_collection)

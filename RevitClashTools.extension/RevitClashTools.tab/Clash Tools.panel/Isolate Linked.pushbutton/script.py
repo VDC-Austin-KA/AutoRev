@@ -7,6 +7,8 @@ those elements from that link in the current view. Includes a Reset
 command to restore full link visibility.
 """
 
+from System.Collections.Generic import List
+
 from pyrevit import revit, DB, forms, script
 
 doc = revit.doc
@@ -68,7 +70,7 @@ def pick_categories(link_doc):
 
 def collect_ids(link_doc, category_names):
     collector = DB.FilteredElementCollector(link_doc).WhereElementIsNotElementType()
-    ids = DB.List[DB.ElementId]()
+    ids = List[DB.ElementId]()
     for el in collector:
         if el.Category is None:
             continue
